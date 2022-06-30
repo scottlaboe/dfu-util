@@ -1,9 +1,10 @@
 /*
- * low-level DFU message sending routines, originally taken from
+ * Low-level DFU communication routines, originally taken from
  * $Id: dfu.c,v 1.3 2006/06/20 06:28:04 schmidtw Exp $
  * (part of dfu-programmer).
  *
- * (C) 2005-2006 Weston Schmidt <weston_schmidt@alumni.purdue.edu>
+ * Copyright 2005-2006 Weston Schmidt <weston_schmidt@alumni.purdue.edu>
+ * Copyright 2011-2014 Tormod Volden <debian.tormod@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,45 +21,19 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <libusb.h>
+
+#include "portable.h"
 #include "dfu.h"
+#include "quirks.h"
 
-#define INVALID_DFU_TIMEOUT -1
-
-static int dfu_timeout = INVALID_DFU_TIMEOUT;
-static unsigned short transaction = 0;
-
-static int dfu_debug_level = 0;
-
-void dfu_init( const int timeout )
-{
-    if( timeout > 0 ) {
-        dfu_timeout = timeout;
-    } else {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr, "dfu_init: Invalid timeout value %d.\n", timeout );
-    }
-}
-
-static int dfu_verify_init( const char *function )
-{
-    if( INVALID_DFU_TIMEOUT == dfu_timeout ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: dfu system not property initialized.\n",
-                     function );
-        return -1;
-    }
-
-    return 0;
-}
-
-void dfu_debug( const int level )
-{
-    dfu_debug_level = level;
-}
-
+static int dfu_timeout = 5000;  /* 5 seconds - default */
 
 /*
  *  DFU_DETACH Request (DFU Spec 1.0, Section 5.1)
@@ -74,9 +49,6 @@ int dfu_detach( libusb_device_handle *device,
                 const unsigned short interface,
                 const unsigned short timeout )
 {
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
-
     return libusb_control_transfer( device,
         /* bmRequestType */ LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
         /* bRequest      */ DFU_DETACH,
@@ -102,44 +74,19 @@ int dfu_detach( libusb_device_handle *device,
 int dfu_download( libusb_device_handle *device,
                   const unsigned short interface,
                   const unsigned short length,
+                  const unsigned short transaction,
                   unsigned char* data )
 {
     int status;
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
-
-    /* Sanity checks */
-    if( (0 != length) && (NULL == data) ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: data was NULL, but length != 0\n",
-                     __FUNCTION__ );
-        return -1;
-    }
-
-    if( (0 == length) && (NULL != data) ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: data was not NULL, but length == 0\n",
-                     __FUNCTION__ );
-        return -2;
-    }
-
     status = libusb_control_transfer( device,
           /* bmRequestType */ LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
           /* bRequest      */ DFU_DNLOAD,
-          /* wValue        */ transaction++,
+          /* wValue        */ transaction,
           /* wIndex        */ interface,
           /* Data          */ data,
           /* wLength       */ length,
                               dfu_timeout );
-    if( status < 0 ) {
-        fprintf( stderr, "%s: libusb_control_transfer returned %d\n",
-		 __FUNCTION__,
-		 status);
-    }
-
     return status;
 }
 
@@ -158,36 +105,19 @@ int dfu_download( libusb_device_handle *device,
 int dfu_upload( libusb_device_handle *device,
                 const unsigned short interface,
                 const unsigned short length,
+                const unsigned short transaction,
                 unsigned char* data )
 {
     int status;
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
-
-    /* Sanity checks */
-    if( (0 == length) || (NULL == data) ) {
-        if( 0 != dfu_debug_level )
-            fprintf( stderr,
-                     "%s: data was NULL, or length is 0\n",
-                     __FUNCTION__ );
-        return -1;
-    }
-
     status = libusb_control_transfer( device,
           /* bmRequestType */ LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
           /* bRequest      */ DFU_UPLOAD,
-          /* wValue        */ transaction++,
+          /* wValue        */ transaction,
           /* wIndex        */ interface,
           /* Data          */ data,
           /* wLength       */ length,
                               dfu_timeout );
-    if( status < 0 ) {
-        fprintf( stderr, "%s: libusb_control_msg returned %d\n",
-		 __FUNCTION__,
-		 status);
-    }
-
     return status;
 }
 
@@ -201,15 +131,10 @@ int dfu_upload( libusb_device_handle *device,
  *
  *  return the number of bytes read in or < 0 on an error
  */
-int dfu_get_status( libusb_device_handle *device,
-                    const unsigned short interface,
-                    struct dfu_status *status )
+int dfu_get_status( struct dfu_if *dif, struct dfu_status *status )
 {
     unsigned char buffer[6];
     int result;
-
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
 
     /* Initialize the status data structure */
     status->bStatus       = DFU_STATUS_ERROR_UNKNOWN;
@@ -217,21 +142,23 @@ int dfu_get_status( libusb_device_handle *device,
     status->bState        = STATE_DFU_ERROR;
     status->iString       = 0;
 
-    result = libusb_control_transfer( device,
+    result = libusb_control_transfer( dif->dev_handle,
           /* bmRequestType */ LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
           /* bRequest      */ DFU_GETSTATUS,
           /* wValue        */ 0,
-          /* wIndex        */ interface,
+          /* wIndex        */ dif->interface,
           /* Data          */ buffer,
           /* wLength       */ 6,
                               dfu_timeout );
 
     if( 6 == result ) {
         status->bStatus = buffer[0];
-        status->bwPollTimeout = ((0xff & buffer[3]) << 16) |
-                                ((0xff & buffer[2]) << 8)  |
-                                (0xff & buffer[1]);
-
+        if (dif->quirks & QUIRK_POLLTIMEOUT)
+            status->bwPollTimeout = DEFAULT_POLLTIMEOUT;
+        else
+            status->bwPollTimeout = ((0xff & buffer[3]) << 16) |
+                                    ((0xff & buffer[2]) << 8)  |
+                                    (0xff & buffer[1]);
         status->bState  = buffer[4];
         status->iString = buffer[5];
     }
@@ -251,9 +178,6 @@ int dfu_get_status( libusb_device_handle *device,
 int dfu_clear_status( libusb_device_handle *device,
                       const unsigned short interface )
 {
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
-
     return libusb_control_transfer( device,
         /* bmRequestType */ LIBUSB_ENDPOINT_OUT| LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
         /* bRequest      */ DFU_CLRSTATUS,
@@ -282,9 +206,6 @@ int dfu_get_state( libusb_device_handle *device,
     int result;
     unsigned char buffer[1];
 
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
-
     result = libusb_control_transfer( device,
           /* bmRequestType */ LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
           /* bRequest      */ DFU_GETSTATE,
@@ -295,9 +216,8 @@ int dfu_get_state( libusb_device_handle *device,
                               dfu_timeout );
 
     /* Return the error if there is one. */
-    if( result < 1 ) {
-        return result;
-    }
+    if (result < 1)
+	return -1;
 
     /* Return the state. */
     return buffer[0];
@@ -315,9 +235,6 @@ int dfu_get_state( libusb_device_handle *device,
 int dfu_abort( libusb_device_handle *device,
                const unsigned short interface )
 {
-    if( 0 != dfu_verify_init(__FUNCTION__) )
-        return -1;
-
     return libusb_control_transfer( device,
         /* bmRequestType */ LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE,
         /* bRequest      */ DFU_ABORT,
@@ -331,9 +248,9 @@ int dfu_abort( libusb_device_handle *device,
 
 const char* dfu_state_to_string( int state )
 {
-    const char *message = NULL;
+    const char *message;
 
-    switch( state ) {
+    switch (state) {
         case STATE_APP_IDLE:
             message = "appIDLE";
             break;
@@ -366,6 +283,9 @@ const char* dfu_state_to_string( int state )
             break;
         case STATE_DFU_ERROR:
             message = "dfuERROR";
+            break;
+        default:
+            message = NULL;
             break;
     }
 
@@ -416,3 +336,25 @@ const char *dfu_status_to_string(int status)
 	return dfu_status_names[status];
 }
 
+int dfu_abort_to_idle(struct dfu_if *dif)
+{
+	int ret;
+	struct dfu_status dst;
+
+	ret = dfu_abort(dif->dev_handle, dif->interface);
+	if (ret < 0) {
+		errx(EX_IOERR, "Error sending dfu abort request");
+		exit(1);
+	}
+	ret = dfu_get_status(dif, &dst);
+	if (ret < 0) {
+		errx(EX_IOERR, "Error during abort get_status");
+		exit(1);
+	}
+	if (dst.bState != DFU_STATE_dfuIDLE) {
+		errx(EX_IOERR, "Failed to enter idle state on abort");
+		exit(1);
+	}
+	milli_sleep(dst.bwPollTimeout);
+	return ret;
+}

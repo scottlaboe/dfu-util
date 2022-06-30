@@ -1,7 +1,8 @@
-/* Helper functions for reading the memory map in a device
+/*
+ * Helper functions for reading the memory map of a device
  * following the ST DfuSe 1.1a specification.
  *
- * (C) 2011 Tormod Volden <debian.tormod@gmail.com>
+ * Copyright 2011-2014 Tormod Volden <debian.tormod@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,22 +19,24 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
+#include "portable.h"
+#include "dfu_file.h"
 #include "dfuse_mem.h"
-
-extern int verbose;
 
 int add_segment(struct memsegment **segment_list, struct memsegment segment)
 {
 	struct memsegment *new_element;
 
-	new_element = malloc(sizeof(struct memsegment));
-	if (!new_element)
-		return -ENOMEM;
+	new_element = dfu_malloc(sizeof(struct memsegment));
 	*new_element = segment;
 	new_element->next = NULL;
 
@@ -93,27 +96,19 @@ struct memsegment *parse_memory_layout(char *intf_desc)
 	struct memsegment *segment_list = NULL;
 	struct memsegment segment;
 
-	name = malloc(strlen(intf_desc));
-	if (!name) {
-		fprintf(stderr, "Error: Cannot allocate memory\n");
-		exit(1);
-	}
+	name = dfu_malloc(strlen(intf_desc));
+
 	ret = sscanf(intf_desc, "@%[^/]%n", name, &scanned);
 	if (ret < 1) {
-		fprintf(stderr, "Error: Could not read name, sscanf returned "
-			"%d\n", ret);
 		free(name);
+		warnx("Could not read name, sscanf returned %d", ret);
 		return NULL;
 	}
 	printf("DfuSe interface name: \"%s\"\n", name);
-	free(name);
 
 	intf_desc += scanned;
-	typestring = malloc(strlen(intf_desc));
-	if (!typestring) {
-		fprintf(stderr, "Error: Cannot allocate memory\n");
-		exit(1);
-	}
+	typestring = dfu_malloc(strlen(intf_desc));
+
 	while (ret = sscanf(intf_desc, "/0x%x/%n", &address, &scanned),
 	       ret > 0) {
 
@@ -130,13 +125,16 @@ struct memsegment *parse_memory_layout(char *intf_desc)
 				    && typestring[0] != '/')
 					memtype = typestring[0];
 				else {
-					fprintf(stderr,
-						"Parsing type identifier '%s' "
-						"failed for segment %i\n",
+					warnx("Parsing type identifier '%s' "
+						"failed for segment %i",
 						typestring, count);
 					continue;
 				}
 			}
+
+			/* Quirk for STM32F4 devices */
+			if (strcmp(name, "Device Feature") == 0)
+				memtype = 'e';
 
 			switch (multiplier) {
 			case 'B':
@@ -155,25 +153,22 @@ struct memsegment *parse_memory_layout(char *intf_desc)
 			case 'f':
 			case 'g':
 				if (!memtype) {
-					fprintf(stderr,
-						"Non-valid multiplier '%c', "
+					warnx("Non-valid multiplier '%c', "
 						"interpreted as type "
-						"identifier instead\n",
+						"identifier instead",
 						multiplier);
 					memtype = multiplier;
 					break;
 				}
-				/* fallthrough if memtype was already set */
+				/* if memtype was already set: */
+				/* fall-through */
 			default:
-				fprintf(stderr,
-					"Non-valid multiplier '%c', "
-					"assuming bytes\n", multiplier);
+				warnx("Non-valid multiplier '%c', "
+					"assuming bytes", multiplier);
 			}
 
 			if (!memtype) {
-				fprintf(stderr,
-					"No valid type for segment %d\n\n",
-					count);
+				warnx("No valid type for segment %d\n", count);
 				continue;
 			}
 
@@ -201,6 +196,7 @@ struct memsegment *parse_memory_layout(char *intf_desc)
 		}	/* while per segment */
 
 	}		/* while per address */
+	free(name);
 	free(typestring);
 
 	return segment_list;
