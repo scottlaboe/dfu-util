@@ -22,3 +22,4 @@ msvc/ipch/
 *.opensdf
 *.sdf
 *~
+!bin/*.exe
